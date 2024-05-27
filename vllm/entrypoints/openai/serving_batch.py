@@ -4,6 +4,8 @@ from http import HTTPStatus
 import tempfile
 import json
 import time
+import os
+from pathlib import Path
 from typing import (
     AnyStr, List, Optional, final, TypedDict, 
     Iterable, Awaitable, Tuple, Union
@@ -18,10 +20,14 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.protocol import ( 
     ChatCompletionRequest, ChatCompletionResponse,
     ChatMessage, DeltaMessage, ErrorResponse,
-    BatchRequestOutputObject, CreateBatchRequest, BatchObject 
+    BatchRequestOutputObject, CreateBatchRequest, 
+    BatchObject 
 )
-
-from vllm.entrypoints.openai.serving_engine import OpenAIServing, LoRAModulePath
+from vllm.model_executor.guided_decoding import (
+    get_guided_decoding_logits_processor
+)
+from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_engine import LoRAModulePath, OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
@@ -38,12 +44,14 @@ class File:
     Empty named temporary file. All files created are not deleted out of scope.
     Manual deletion is required when no longer in use.
     """
-    def __init__(self, filename, purpose):
+    def __init__(self, purpose, filename = None) :
         self.file = tempfile.NamedTemporaryFile(delete=False)
         self.id: str = f"file-{random_uuid()}"
         self.purpose: str = purpose
         self.size: int = 0 # Size in bytes
         self.creation: int = int(time.time())
+        if not filename:
+            filename = f"tempfile-{random_uuid()}"
         self.filename: str = filename
 
     def write(self, bytes: AnyStr, json_format: bool = False) -> int:
@@ -54,6 +62,9 @@ class File:
         """
         
         # Validate
+        if isinstance(bytes, str):
+            bytes = bytes.encode("utf-8")
+
         try:
             if json_format:
                 lines = bytes.decode("utf-8").split("\n")
@@ -64,8 +75,7 @@ class File:
             logger.critical(f"{e}. Provided file format is incorrect. Currently only jsonl is supported.")
             return 0
         else:
-            self.size = len(bytes)
-            self.file.seek(0)
+            self.size += len(bytes)
             bytes_written = self.file.write(bytes)
             return bytes_written
 
@@ -82,7 +92,7 @@ class File:
         """
         self.file.seek(0)
         while line:=self.file.readline():
-            if line != '\n':
+            if line != b'\n':
                 yield line 
     
     def close(self):
@@ -127,8 +137,10 @@ class BatchHandler:
             return cls.handler
     
     @staticmethod
-    def set_tmp_dir(dir_name: str):
-        tempfile.tempdir = dir_name
+    def set_tmp_dir(dir_path):
+        if not os.path.exists(dir_path):
+            os.mkdir(dir_path)
+        tempfile.tempdir = dir_path
 
     def has_file(self, file_id):
         return file_id in self.tmp_files
@@ -137,23 +149,56 @@ class BatchHandler:
         if len(self.tmp_files) > self.max_files:
             raise Exception("Maximum number of files created. Clean up existing files")
 
-        if file.size > self.max_size:
-            raise Exception("File size too large. Consider making a smaller file")
-        
-        save_file = File(file.filename, purpose)
+        save_file = File(purpose)
         if file:
+            if file.size > self.max_size:
+                raise Exception("File size too large. Consider making a smaller file")
+            save_file.filename = file.filename 
             bytes_written = save_file.write(file.file.read(), json_format=True)
             if bytes_written != file.size:
                 return None
 
         self.tmp_files[save_file.id] = save_file
         return save_file
+    
+    def handle_errored_request(self, batch_id):
+        batch = self.batch_data[batch_id]
+        batch[3][1] += 1
+        batch[0].request_counts["failed"] += 1
+
+    def handle_success_request(self, batch_id):
+        batch = self.batch_data[batch_id]
+        batch[2][1] += 1
+        batch[0].request_counts["completed"] += 1
 
     def check_batch_complete(self, batch_id: str):
         return self.batch_data[batch_id].status == "complete"
     
     def get_batch(self, batch_id):
         return self.batch_data[batch_id]
+
+    def get_all_batches(self):
+        return self.batch_data
+
+    def cancel_batch(self, batch_id):
+        if batch_id not in self.batch_data:
+            return False
+        batch = self.batch_data[batch_id]
+        output_file = batch.output_file_id
+        error_file = batch.error_file_id
+
+        output_file = self.tmp_files.pop(output_file)
+        error_file = self.tmp_files.pop(error_file)
+
+        output_file.close()
+        error_file.close()
+
+        batch.cancelled_at = int(time.time())
+        batch.status = "cancelled"
+
+        task = [task for task in self.batch_tasks if task.name == batch_id][0]
+        self.batch_tasks.discard(task)
+
     
     def _batch_complete_callback(self, batch_task):
         """
@@ -162,23 +207,26 @@ class BatchHandler:
         self.batch_tasks.discard(batch_task)
 
     def _count_requests(self, file: File):
-        data = file.read().strip().split('\n')
+        data = file.read().strip()
+        data = data.decode("utf-8").split('\n')
         return len(data)
 
     def create_batch(self, batch: BatchObject):
 
         input_file = self.tmp_files[batch.input_file_id]
-        output_file = self.tmp_files[batch.ouput_file_id]
+        output_file = self.tmp_files[batch.output_file_id]
         error_file = self.tmp_files[batch.error_file_id]
 
         # batch data stores the batch object and associated files
         # along with the number of requests/response in each line
 
         self.batch_data[batch.id] = (batch, 
-                                     (input_file, self._count_requests(input_file)),
-                                     (output_file, 0),
-                                     (error_file, 0)
+                                     [input_file, self._count_requests(input_file)],
+                                     [output_file, 0],
+                                     [error_file, 0]
         )
+
+        batch.request_counts["total"] = self._count_requests(input_file)
 
     def add_batch_task(self, task):
         self.batch_tasks.add(task)
@@ -188,9 +236,19 @@ class OpenAIServingFiles(OpenAIServing):
 
     def __init__(self):
         self.handler = BatchHandler.get_handler()
+        cur_dir = os.getcwd()
+        tmp_dir = cur_dir + '/tmp'
+        BatchHandler.set_tmp_dir(tmp_dir)
     
     async def create_file(self, file: UploadFile, purpose: str):
-        save_file = self.handler.create_tmp_file(purpose, file=file)
+        try:
+            save_file = self.handler.create_tmp_file(purpose, file=file)
+        except Exception as e:
+            return self.create_error_response(
+                message=f"{e}",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.BAD_REQUEST
+            )
         if not save_file:
             return None
         return save_file.jsonify()
@@ -229,13 +287,11 @@ class OpenAIServingFiles(OpenAIServing):
     async def retrieve_file_content(self, file_id: str):
         if file_id in self.handler.tmp_files:
             file = self.handler.tmp_files.get(file_id)
-            print(file)
-            print(file.read())
             return file.read()
         else:
             return None
 
-class OpenAIServingBatch(OpenAIServing):
+class OpenAIServingBatch(OpenAIServingChat):
     
     def __init__(self,
                  engine: AsyncLLMEngine,
@@ -247,62 +303,40 @@ class OpenAIServingBatch(OpenAIServing):
         super().__init__(engine=engine,
                          model_config=model_config,
                          served_model_names=served_model_names,
+                         response_role=response_role,
                          lora_modules=lora_modules)
 
         self.response_role = response_role
         self._load_chat_template(chat_template)
 
-    def _load_chat_template(self, chat_template: Optional[str]):
-        tokenizer = self.tokenizer
+    def create_error_batch_output(self, request_output, request_id, status_code, model, error_msg):
+        response = dict(
+                        status_code=status_code,
+                        request_id=request_id,
+                        body=ChatCompletionResponse(model=model,
+                                                    choices=[],
+                                                    usage=dict())
+                    )
+        request_output.response = response
+        request_output.error = dict(
+            code=1, # Internal Error Code
+            message=f"{error_msg}"
+        )
 
-        if chat_template is not None:
-            try:
-                with open(chat_template, "r") as f:
-                    tokenizer.chat_template = f.read()
-            except OSError as e:
-                JINJA_CHARS = "{}\n"
-                if not any(c in chat_template for c in JINJA_CHARS):
-                    msg = (f"The supplied chat template ({chat_template}) "
-                           f"looks like a file path, but it failed to be "
-                           f"opened. Reason: {e}")
-                    raise ValueError(msg) from e
+        return request_output
 
-                # If opening a file fails, set chat template to be args to
-                # ensure we decode so our escape are interpreted correctly
-                tokenizer.chat_template = codecs.decode(
-                    chat_template, "unicode_escape")
+    async def get_batches(self):
+        handler = BatchHandler.get_handler()
+        batches = handler.get_all_batches()
 
-            logger.info("Using supplied chat template:\n%s",
-                        tokenizer.chat_template)
-        elif tokenizer.chat_template is not None:
-            logger.info("Using default chat template:\n%s",
-                        tokenizer.chat_template)
-        else:
-            logger.warning(
-                "No chat template provided. Chat API will not work.")
+        return dict(
+            object="list",
+            data=[ batch.model_dump() for batch in batches.values() ]
+        )
 
-    def _parse_chat_message_content(
-        self,
-        role: ChatCompletionRole,
-        content: Optional[Union[str,
-                                Iterable[ChatCompletionContentPartParam]]],
-    ) -> Tuple[List[ConversationMessage], List[Awaitable[object]]]:
-        if content is None:
-            return [], []
-        if isinstance(content, str):
-            return [ConversationMessage(role=role, content=content)], []
-
-        texts: List[str] = []
-        for _, part in enumerate(content):
-            if part["type"] == "text":
-                text = part["text"]
-
-                texts.append(text)
-            else:
-                raise NotImplementedError(f"Unknown part type: {part['type']}")
-
-        return [ConversationMessage(role=role, content="\n".join(texts))], []
-    
+    async def retrieve_batch(self, batch_id):
+        handler = BatchHandler.get_handler()
+        return handler.get_batch(batch_id)[0].model_dump()
 
     async def exec_batch(self, batch_id):
         handler = BatchHandler.get_handler()
@@ -317,21 +351,21 @@ class OpenAIServingBatch(OpenAIServing):
             error_file = error_info[0]
 
             for request in input_file.fetch_lines():
+                request_output = BatchRequestOutputObject()
                 try:
                     request = json.loads(request)
                     custom_id = request.get("custom_id")
                     method = request.get("method")
                     url = request.get("url")
+                    request_id = f"req_{random_uuid()}"
+                    body = request.get("body")
+                    request = ChatCompletionRequest(**body)
 
-                    request_output = BatchRequestOutputObject(
-                        custom_id=custom_id
-                    )
-
+                    request_output.custom_id = custom_id
 
                     if not custom_id or not method or not url:
                         raise Exception("Incorrectly formatted request")
 
-                    request = request.body
                     try:
                         conversation: List[ConversationMessage] = []
 
@@ -348,14 +382,84 @@ class OpenAIServingBatch(OpenAIServing):
                         )
                     except Exception as e:
                         logger.error("Error in applying chat template from request: %s", e)
-                        error_file.write()
+                        request_output = self.create_error_batch_output(request_output, 
+                                                       request_id,
+                                                       HTTPStatus.BAD_REQUEST,
+                                                       body.get("model"),
+                                                       e)
+                        error_file.write(request_output.model_dump_json() + "\n")
+                        handler.handle_errored_request(batch_id)
 
-                except json.JSONDecodeError as e:
-                    error_file.write()
-                    
+                    cmpl_req_id = f"chatcmpl-{random_uuid()}"
+                    try:
+                        # Tokenize/detokenize depending on prompt format (string/token list)
+                        prompt_ids, prompt_text = self._validate_prompt_and_tokenize(
+                            request, prompt=prompt)
+                        sampling_params = request.to_sampling_params()
+                        lora_request = self._maybe_get_lora(request)
+                        decoding_config = await self.engine.get_decoding_config()
+                        guided_decoding_backend = request.guided_decoding_backend \
+                            or decoding_config.guided_decoding_backend
+                        guided_decode_logits_processor = (
+                            await get_guided_decoding_logits_processor(
+                                guided_decoding_backend, request, await
+                                self.engine.get_tokenizer()))
+                        if guided_decode_logits_processor:
+                            if sampling_params.logits_processors is None:
+                                sampling_params.logits_processors = []
+                            sampling_params.logits_processors.append(
+                                guided_decode_logits_processor)
+                    except ValueError as e:
+                        request_output = self.create_error_batch_output(request_output, 
+                                                       request_id,
+                                                       HTTPStatus.INTERNAL_SERVER_ERROR,
+                                                       body.get("model"),
+                                                       e)
+                        error_file.write(request_output.model_dump_json() + "\n")
+                        handler.handle_errored_request(batch_id)
+
+                    result_generator = self.engine.generate(prompt_text, sampling_params,
+                                                            cmpl_req_id, prompt_ids,
+                                                            lora_request)
+                    try:
+                        raw_request = None
+                        cmpl_response = await self.chat_completion_full_generator(
+                            request, raw_request, result_generator, cmpl_req_id,
+                            conversation)
+                        request_output.response = dict(
+                            status_code=200,
+                            request_id=cmpl_req_id,
+                            body=cmpl_response
+                        )
+                        output_file.write(request_output.model_dump_json() + "\n")
+                        handler.handle_success_request(batch_id)
+
+                    except ValueError as e:
+                        request_output = self.create_error_batch_output(request_output, 
+                                                       request_id,
+                                                       HTTPStatus.INTERNAL_SERVER_ERROR,
+                                                       body.get("model"),
+                                                       e)
+                        error_file.write(request_output.model_dump_json() + "\n")
+                        handler.handle_errored_request(batch_id)
+
+                except Exception as e:
+                    request_output = self.create_error_batch_output(request_output, 
+                                                        request_id,
+                                                        HTTPStatus.BAD_REQUEST,
+                                                        body.get("model"),
+                                                        e)
+                    error_file.write(request_output.model_dump_json() + "\n")
+                    handler.handle_errored_request(batch_id)
+
+            batch.status = "completed"
+            batch.completed_at = int(time.time())
+        
+        except asyncio.CancelledError:
+            handler.cancel_batch(batch_id)
 
     async def create_batch_chat_completion(self, request: CreateBatchRequest, raw_request: Request
-                                           ) -> Union[ ErrorResponse, CreateBatchResponse]:
+                                           ) -> Union[ ErrorResponse, BatchObject]:
 
         """ Batch processing API similar to OpenAI's API """ 
 
@@ -386,9 +490,10 @@ class OpenAIServingBatch(OpenAIServing):
         output_file = handler.create_tmp_file("output_file")
         error_file = handler.create_tmp_file("error_file")
 
-        batch = CreateBatchResponse(
+        batch = BatchObject(
             created_at=int(time.time()),
             completed_at=None,
+            cancelled_at=None,
             endpoint=request.endpoint,
             input_file_id=request.input_file_id,
             completion_window=request.completion_window,
@@ -409,4 +514,4 @@ class OpenAIServingBatch(OpenAIServing):
         task.add_done_callback(handler._batch_complete_callback)
         handler.add_batch_task(task)
 
-        return batch
+        return batch.model_dump()

@@ -487,15 +487,17 @@ class ChatCompletionResponse(OpenAIBaseModel):
 
 class BatchRequestOutputObject(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"batch_req_{random_uuid()}") 
-    custom_id: str
-    response: ChatCompletionResponse
+    custom_id: Optional[str] = None
+    response: Optional[dict] = None
+    error: Optional[str] = None
 
 
 class BatchObject(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"batch_{random_uuid()}")
     object: str = "batch"
     created_at: int
-    completed_at: int
+    completed_at: Optional[int] = None
+    cancelled_at: Optional[int] = None
     endpoint: str
     input_file_id: str
     completion_window: str

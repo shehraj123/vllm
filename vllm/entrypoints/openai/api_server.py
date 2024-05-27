@@ -24,8 +24,7 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               CompletionRequest,
                                               EmbeddingRequest, 
                                               ErrorResponse,
-                                              CreateBatchRequest,
-                                              CreateBatchResponse)
+                                              CreateBatchRequest)
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -180,7 +179,24 @@ async def retrieve_file_content(file_id):
 @app.post("/v1/batches")
 async def create_exec_batch(request: CreateBatchRequest, raw_request: Request):
     response = await openai_serving_batch.create_batch_chat_completion(request, raw_request) 
-    return response 
+    print(response)
+    return JSONResponse(content=response) 
+
+@app.get("/v1/batches")
+async def get_batches():
+    response = await openai_serving_batch.get_batches()
+    return JSONResponse(content=response)
+
+@app.get("/v1/batches/{batch_id}")
+async def retrieve_batch(batch_id: str):
+    response = await openai_serving_batch.retrieve_batch(batch_id)
+    return JSONResponse(content=response)
+
+@app.post("/v1/batches/{batch_id}/cancel")
+async def cancel_batch(batch_id: str):
+    response = await openai_serving_batch.cancel_batch(batch_id)
+    return JSONResponse(content=response)
+
 
 
 if __name__ == "__main__":
